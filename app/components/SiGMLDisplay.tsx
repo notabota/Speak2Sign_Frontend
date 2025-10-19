@@ -6,8 +6,15 @@ import { Badge } from "@/app/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/app/components/ui/select";
 import { User } from 'lucide-react';
 
-interface SiGMLDisplayProps {
+interface SentenceSegment {
+  transcription: string;
+  gloss: string;
   sigml: string;
+}
+
+interface SiGMLDisplayProps {
+  sentences: SentenceSegment[];
+  currentSegment: Partial<SentenceSegment>;
   isVisible: boolean;
 }
 
@@ -21,14 +28,18 @@ declare global {
   }
 }
 
-export const SiGMLDisplay: React.FC<SiGMLDisplayProps> = ({ sigml, isVisible }) => {
+export const SiGMLDisplay: React.FC<SiGMLDisplayProps> = ({ sentences, currentSegment, isVisible }) => {
   const [selectedAvatar, setSelectedAvatar] = useState('luna');
   const [cwasakLoaded, setCwasaLoaded] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playedSentences, setPlayedSentences] = useState(0);
+  const [currentlyPlayingGloss, setCurrentlyPlayingGloss] = useState<string>('');
+  const [currentWordIndex, setCurrentWordIndex] = useState<number>(-1);
 
   const initOnceRef = useRef(false);
-  const lastSigmlRef = useRef<string>('');
-  const lastTokenCountRef = useRef<number>(0);
-  const pendingSigmlRef = useRef<string | null>(null);
+  const pendingSentencesRef = useRef<SentenceSegment[]>([]);
+  const playbackQueueRef = useRef<SentenceSegment[]>([]);
+  const isPlayingRef = useRef(false);
 
   const ts = () => new Date().toISOString().slice(11, 23);
 
@@ -61,9 +72,62 @@ export const SiGMLDisplay: React.FC<SiGMLDisplayProps> = ({ sigml, isVisible }) 
     return clean.length > n ? `${clean.slice(0, n)}…` : clean;
   };
 
+  // Estimate animation duration based on gloss content
+  const estimateAnimationDuration = (gloss: string): number => {
+    const words = gloss.trim().split(/\s+/).filter(w => w.length > 0);
+    // Rough estimate: 800ms per sign + 200ms base time
+    return Math.max(1000, words.length * 800 + 200);
+  };
+
+  // Sequential sentence player - waits for each animation to finish
+  const playNextSentence = async () => {
+    if (isPlayingRef.current || playbackQueueRef.current.length === 0) return;
+
+    const sentence = playbackQueueRef.current.shift();
+    if (!sentence || !sentence.sigml?.trim()) {
+      // No valid sentence, try next
+      setTimeout(playNextSentence, 50);
+      return;
+    }
+
+    isPlayingRef.current = true;
+    setIsPlaying(true);
+    setCurrentlyPlayingGloss(sentence.gloss);
+
+    // Animate through gloss words
+    const glossWords = sentence.gloss.trim().split(/\s+/).filter(w => w.length > 0);
+    const wordDuration = Math.max(600, estimateAnimationDuration(sentence.gloss) / glossWords.length);
+
+    try {
+      console.info(`[SB ${ts()}] playing sentence: "${preview(sentence.transcription, 60)}" → gloss: "${sentence.gloss}"`);
+      window.CWASA.playSiGMLText(sentence.sigml);
+
+      // Animate through words
+      for (let i = 0; i < glossWords.length; i++) {
+        setCurrentWordIndex(i);
+        await new Promise(resolve => setTimeout(resolve, wordDuration));
+      }
+
+      // Wait a bit after animation completes
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+    } catch (e) {
+      console.error(`[SB ${ts()}] playSiGMLText error`, e);
+    }
+
+    // Clear current playing state
+    setCurrentlyPlayingGloss('');
+    setCurrentWordIndex(-1);
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+
+    // Play next sentence in queue
+    setTimeout(playNextSentence, 100);
+  };
+
   // --- Load & init CWASA (once) ---
   useEffect(() => {
-    console.info(`[SB ${ts()}] mount isVisible=${isVisible} hasSigml=${!!sigml}`);
+    console.info(`[SB ${ts()}] mount isVisible=${isVisible} sentenceCount=${sentences.length}`);
     if (!isVisible) return;
 
     const ensureContainer = () => {
@@ -88,19 +152,15 @@ export const SiGMLDisplay: React.FC<SiGMLDisplayProps> = ({ sigml, isVisible }) 
         setCwasaLoaded(true);
         console.info(`[SB ${ts()}] CWASA initialized ✔`);
 
-        if (pendingSigmlRef.current) {
-          const pending = pendingSigmlRef.current;
-          pendingSigmlRef.current = null;
-          console.info(`[SB ${ts()}] consuming pending SiGML after init (len=${pending.length})`);
-          try {
-            window.CWASA.playSiGMLText(pending);
-            lastSigmlRef.current = pending;
-            const { tokens } = tokenizeFromSigML(pending);
-            lastTokenCountRef.current = tokens.length;
-            console.info(`[SB ${ts()}] played pending; baseline tokenCount=${tokens.length}`);
-          } catch (e) {
-            console.error(`[SB ${ts()}] playSiGMLText (pending) error`, e);
-          }
+        // Play any pending sentences after initialization
+        if (pendingSentencesRef.current.length > 0) {
+          const pendingSentences = pendingSentencesRef.current;
+          pendingSentencesRef.current = [];
+          console.info(`[SB ${ts()}] consuming ${pendingSentences.length} pending sentences after init`);
+
+          // Add to playback queue
+          playbackQueueRef.current.push(...pendingSentences);
+          playNextSentence();
         }
       } catch (e) {
         console.error(`[SB ${ts()}] CWASA.init error`, e);
@@ -153,46 +213,51 @@ export const SiGMLDisplay: React.FC<SiGMLDisplayProps> = ({ sigml, isVisible }) 
     console.debug(`[SB ${ts()}] cwasaLoaded=${cwasakLoaded}`);
   }, [cwasakLoaded]);
 
-  // --- Auto-play ---
+  // --- Sequential Sentence Playback ---
   useEffect(() => {
     const ready = isVisible && cwasakLoaded && !!window.CWASA;
-    console.debug(`[SB ${ts()}] auto-play check → ready=${ready}, hasSigML=${!!sigml}`);
+    console.debug(`[SB ${ts()}] sentence playback check → ready=${ready}, newSentences=${sentences.length - playedSentences}`);
 
-    if (!sigml || !sigml.trim()) return;
+    if (sentences.length <= playedSentences) return;
+
+    const newSentences = sentences.slice(playedSentences);
 
     if (!ready) {
-      pendingSigmlRef.current = sigml;
-      console.info(`[SB ${ts()}] queued sigml (len=${sigml.length}) until CWASA ready`);
+      // Queue new sentences until CWASA is ready
+      pendingSentencesRef.current.push(...newSentences);
+      console.info(`[SB ${ts()}] queued ${newSentences.length} sentences until CWASA ready`);
+      setPlayedSentences(sentences.length);
       return;
     }
 
-    const { tokens, source } = tokenizeFromSigML(sigml);
-    console.info(`[SB ${ts()}] token source=${source}, count=${tokens.length}`);
-    console.debug(`[SB ${ts()}] tokens (first 20)`, tokens.slice(0, 20));
-    console.log(`[SB ${ts()}] incoming sigml (preview): len=${sigml.length} :: "${preview(sigml, 120)}"`);
+    // Add new sentences to playback queue
+    playbackQueueRef.current.push(...newSentences);
+    console.info(`[SB ${ts()}] added ${newSentences.length} sentences to playback queue`);
 
-    const prev = lastTokenCountRef.current;
-    const curr = tokens.length;
-    console.info(`[SB ${ts()}] tokenCount: prev=${prev} → curr=${curr}`);
-
-    if (curr > prev) {
-      try {
-        console.info(`[SB ${ts()}] auto-playing NEW SiGML…`);
-        window.CWASA.playSiGMLText(sigml);
-        lastSigmlRef.current = sigml;
-        lastTokenCountRef.current = curr;
-        console.info(`[SB ${ts()}] playback issued ✔ (baseline now ${curr})`);
-      } catch (e) {
-        console.error(`[SB ${ts()}] playSiGMLText error`, e);
-      }
-    } else if (sigml !== lastSigmlRef.current) {
-      lastSigmlRef.current = sigml;
-      lastTokenCountRef.current = curr;
-      console.debug(`[SB ${ts()}] baseline updated (no growth)`);
+    // Start playing if not already playing
+    if (!isPlayingRef.current) {
+      playNextSentence();
     }
-  }, [sigml, cwasakLoaded, isVisible]);
 
-  const hasContent = !!sigml && sigml.trim().length > 0;
+    // Update played count
+    setPlayedSentences(sentences.length);
+  }, [sentences, cwasakLoaded, isVisible, playedSentences]);
+
+  // Reset played count when recording is cleared
+  useEffect(() => {
+    if (sentences.length === 0) {
+      setPlayedSentences(0);
+      pendingSentencesRef.current = [];
+      playbackQueueRef.current = [];
+      setCurrentlyPlayingGloss('');
+      setCurrentWordIndex(-1);
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+    }
+  }, [sentences.length]);
+
+  const hasContent = sentences.length > 0 || (currentSegment.sigml && currentSegment.sigml.trim().length > 0);
+  const latestSigml = sentences.length > 0 ? sentences[sentences.length - 1].sigml : (currentSegment.sigml || '');
 
   return (
       <Card className="p-4 bg-gradient-subtle border-2 border-accent/20 shadow-soft">
@@ -203,7 +268,7 @@ export const SiGMLDisplay: React.FC<SiGMLDisplayProps> = ({ sigml, isVisible }) 
                 variant={hasContent ? 'default' : 'outline'}
                 className={hasContent ? 'bg-green-100 text-green-700 border-green-200 text-xs' : 'bg-gray-50 text-gray-500 border-gray-200 text-xs'}
             >
-              {hasContent ? 'Auto' : 'Waiting…'}
+              {hasContent ? `${sentences.length} sentences` : 'Waiting…'}
             </Badge>
           </div>
 
@@ -241,11 +306,33 @@ export const SiGMLDisplay: React.FC<SiGMLDisplayProps> = ({ sigml, isVisible }) 
             <input type="text" className="txtSiGMLURL av0" style={{ display: 'none' }} defaultValue="" />
           </div>
 
+          {currentlyPlayingGloss && (
+              <div className="bg-green-50 rounded-lg p-3 border border-green-200">
+                <p className="text-xs text-green-700 font-medium mb-2">Currently Playing:</p>
+                <div className="flex flex-wrap gap-1">
+                  {currentlyPlayingGloss.split(' ').filter(w => w.length > 0).map((word, index) => (
+                    <Badge
+                      key={index}
+                      className={`px-2 py-1 text-xs font-semibold transition-all duration-200 ${
+                        index === currentWordIndex
+                          ? 'bg-green-500 text-white border-green-600 transform scale-110'
+                          : index < currentWordIndex
+                          ? 'bg-green-200 text-green-700 border-green-300'
+                          : 'bg-green-100 text-green-600 border-green-200'
+                      }`}
+                    >
+                      {word}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+          )}
+
           {hasContent && (
               <div className="bg-accent/10 rounded-lg p-3 border border-accent/20">
-                <p className="text-xs text-muted-foreground mb-2">SiGML Code Preview:</p>
+                <p className="text-xs text-muted-foreground mb-2">Latest SiGML Preview:</p>
                 <code className="text-xs text-foreground block max-h-20 overflow-y-auto">
-                  {sigml.substring(0, 200)}…
+                  {latestSigml.substring(0, 200)}…
                 </code>
               </div>
           )}

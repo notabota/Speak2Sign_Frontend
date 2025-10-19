@@ -12,91 +12,59 @@ interface VADResult {
   transcription?: string;
   gloss?: string;
   sigml?: string;
-  requestFullGloss?: boolean;
+  isNewSegment?: boolean;
+}
+
+interface SentenceSegment {
+  transcription: string;
+  gloss: string;
+  sigml: string;
 }
 
 export default function HomePage() {
-  const [vadResult, setVADResult] = useState<VADResult | null>(null);
+  const [sentences, setSentences] = useState<SentenceSegment[]>([]);
+  const [currentSegment, setCurrentSegment] = useState<Partial<SentenceSegment>>({});
 
   const handleVADUpdate = async (result: VADResult) => {
     console.log('VAD update received:', result);
 
-    if (result.transcription || result.gloss || result.sigml) {
-      setVADResult(prevResult => {
-        const newTranscription = result.transcription ?
-          (prevResult?.transcription ? `${prevResult.transcription} ${result.transcription}` : result.transcription) :
-          (prevResult?.transcription || '');
-
-        // If we have a new transcription and need full gloss, generate it
-        if (result.requestFullGloss && newTranscription) {
-          // Trigger async gloss generation for the complete transcription
-          setTimeout(() => generateFullGloss(newTranscription), 0);
-        }
-
-        return {
-          transcription: newTranscription,
-          gloss: result.gloss || prevResult?.gloss || '',
-          sigml: result.sigml || prevResult?.sigml || ''
-        };
-      });
+    if (result.transcription) {
+      // New transcription segment started
+      setCurrentSegment(prev => ({
+        ...prev,
+        transcription: result.transcription
+      }));
     }
-  };
 
-  const generateFullGloss = async (fullTranscription: string) => {
-    try {
-      const glossResponse = await fetch('http://localhost:5000/text-to-gloss', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ text: fullTranscription })
-      });
-
-      if (glossResponse.ok) {
-        const glossResult = await glossResponse.json();
-        const newGloss = glossResult.gloss || '';
-
-        // Update with gloss first
-        setVADResult(prevResult => ({
-          ...prevResult,
-          gloss: newGloss,
-          sigml: prevResult?.sigml || ''
-        }));
-
-        // Then generate SiGML from the gloss
-        if (newGloss) {
-          await generateSiGML(newGloss);
-        }
-      }
-    } catch (error) {
-      console.error('Failed to generate full gloss:', error);
+    if (result.gloss) {
+      // Gloss received for current segment
+      setCurrentSegment(prev => ({
+        ...prev,
+        gloss: result.gloss
+      }));
     }
-  };
 
-  const generateSiGML = async (gloss: string) => {
-    try {
-      const sigmlResponse = await fetch('http://localhost:5000/gloss-to-sigml', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ gloss: gloss })
-      });
+    if (result.sigml && result.isNewSegment) {
+      // Complete segment ready - add to sentences and trigger animation
+      const completeSegment: SentenceSegment = {
+        transcription: currentSegment.transcription || '',
+        gloss: result.gloss || currentSegment.gloss || '',
+        sigml: result.sigml
+      };
 
-      if (sigmlResponse.ok) {
-        const sigmlResult = await sigmlResponse.json();
-        setVADResult(prevResult => ({
-          ...prevResult,
-          sigml: sigmlResult.sigml || ''
-        }));
-      }
-    } catch (error) {
-      console.error('Failed to generate SiGML:', error);
+      setSentences(prev => [...prev, completeSegment]);
+
+      // Clear current segment for next one
+      setCurrentSegment({});
+
+      // Trigger animation for this new segment
+      // The SiGML component will auto-play when it receives new content
     }
   };
 
   const handleClearResults = () => {
-    setVADResult(null);
+    setSentences([]);
+    setCurrentSegment({});
   };
   return (
     <div className="min-h-screen bg-gradient-subtle flex flex-col">
@@ -135,16 +103,16 @@ export default function HomePage() {
               <div className="space-y-3">
                 {/* Transcription Display */}
                 <TranscriptionDisplay
-                  transcription={vadResult?.transcription || ''}
+                  transcription={sentences.map(s => s.transcription).join(' ') + (currentSegment.transcription ? ` ${currentSegment.transcription}` : '')}
                   isVisible={true}
                   language="English"
                 />
 
                 {/* Gloss Display */}
                 <GlossDisplay
-                  glossText={vadResult?.gloss || ''}
+                  glossText={sentences.map(s => s.gloss).join(' ') + (currentSegment.gloss ? ` ${currentSegment.gloss}` : '')}
                   isVisible={true}
-                  originalText={vadResult?.transcription}
+                  originalText={sentences.map(s => s.transcription).join(' ')}
                 />
               </div>
             </div>
@@ -155,7 +123,8 @@ export default function HomePage() {
                 {/* SiGML Display - Always visible */}
                 <div className="w-full h-full">
                   <SiGMLDisplay
-                    sigml={vadResult?.sigml || ''}
+                    sentences={sentences}
+                    currentSegment={currentSegment}
                     isVisible={true}
                   />
                 </div>

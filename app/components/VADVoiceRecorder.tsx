@@ -11,7 +11,7 @@ interface VADResult {
     transcription?: string;
     gloss?: string;
     sigml?: string;
-    requestFullGloss?: boolean;
+    isNewSegment?: boolean;
 }
 
 interface VADVoiceRecorderProps {
@@ -47,7 +47,7 @@ export function VADVoiceRecorder({
                                      fastApiUrl =
                                          process.env.NEXT_PUBLIC_FALLBACK_TRANSCRIBER_URL ||
                                          "https://australiaeast.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2024-11-15",
-                                     fastApiKey = process.env.NEXT_PUBLIC_FALLBACK_API_KEY,
+                                     fastApiKey = process.env.NEXT_PUBLIC_FALLBACK_API_KEY || "7feed90e615f47f88fdf24fd66743a29",
                                  }: VADVoiceRecorderProps) {
     const [status, setStatus] = useState<"idle" | "listening" | "error">("idle");
     const [isProcessing, setIsProcessing] = useState(false);
@@ -72,18 +72,18 @@ export function VADVoiceRecorder({
     // ====== VAD parameters (tweak to taste) ======
     const FRAME_SIZE_MS = 10; // analysis frame size
     const HOP_MS = 10; // hop == frame size (no overlap)
-    const MIN_VOICE_MS = 250; // minimum speech to keep a segment
-    // LESS SENSITIVE: allow ~0.9s of silence before we close a segment (was 300ms)
-    const MAX_SILENCE_HANGOVER_MS = 900;
-    // Require a few consecutive voiced frames to start a segment (was 3)
-    const START_TRIGGER_FRAMES = 4;
+    const MIN_VOICE_MS = 200; // minimum speech to keep a segment (reduced from 250ms)
+    // More sensitive: allow only ~0.4s of silence before we close a segment (reduced from 900ms)
+    const MAX_SILENCE_HANGOVER_MS = 400;
+    // Require fewer consecutive voiced frames to start a segment (reduced from 4)
+    const START_TRIGGER_FRAMES = 2;
     const STOP_TRIGGER_FRAMES = Math.ceil(MAX_SILENCE_HANGOVER_MS / HOP_MS);
     const TARGET_SR = 16000;
 
-    // Adaptive threshold params
+    // Adaptive threshold params - more sensitive
     const NOISE_ALPHA = 0.95; // higher -> slower noise tracking
-    const LEVEL_SENSITIVITY = 2.0; // threshold = noiseRms * LEVEL_SENSITIVITY
-    const MIN_DBFS_GATE = -50; // below this (approx), treat as silence regardless of noise
+    const LEVEL_SENSITIVITY = 1.5; // threshold = noiseRms * LEVEL_SENSITIVITY (reduced from 2.0)
+    const MIN_DBFS_GATE = -55; // below this (approx), treat as silence regardless of noise (more sensitive)
 
     // Internal VAD state
     const vadStateRef = useRef({
@@ -188,6 +188,8 @@ export function VADVoiceRecorder({
 
     // Called when a full speech segment is detected
     const handleSegment = async (monoSegment: Float32Array, inSr: number) => {
+        const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+
         try {
             // Resample to 16k
             resampleStateRef.current.phase = 0; // reset per segment
@@ -205,12 +207,46 @@ export function VADVoiceRecorder({
                 return;
             }
 
-            // Emit the result upwards, mirroring the prior contract
+            // Step 1: Send transcription for this segment
             onResult?.({
                 transcription,
                 gloss: "",
-                sigml: "",
-                requestFullGloss: true,
+                sigml: ""
+            });
+
+            // Step 2: Generate gloss for THIS segment only
+            const glossResponse = await fetch(`${backendUrl}/text-to-gloss`, {
+                method: "POST",
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ text: transcription })
+            });
+            if (!glossResponse.ok) throw new Error(`Gloss conversion failed: HTTP ${glossResponse.status}`);
+            const glossResult = await glossResponse.json();
+
+            // Step 3: Generate SiGML for this segment's gloss
+            let sigmlContent = '';
+            if (glossResult.gloss) {
+                const sigmlResponse = await fetch(`${backendUrl}/gloss-to-sigml`, {
+                    method: "POST",
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ gloss: glossResult.gloss })
+                });
+                if (sigmlResponse.ok) {
+                    const sigmlResult = await sigmlResponse.json();
+                    sigmlContent = sigmlResult.sigml || '';
+                }
+            }
+
+            // Send complete result for this individual segment
+            onResult?.({
+                transcription: '',  // Empty since already sent
+                gloss: glossResult.gloss || '',
+                sigml: sigmlContent,
+                isNewSegment: true  // Flag to indicate this is a new sentence segment
             });
         } catch (e: any) {
             setErrorMessage(e?.message || "Unknown error while processing segment");
