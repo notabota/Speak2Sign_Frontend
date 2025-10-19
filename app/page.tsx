@@ -29,11 +29,10 @@ export default function HomePage() {
     console.log('VAD update received:', result);
 
     if (result.transcription) {
-      // New transcription segment started
-      setCurrentSegment(prev => ({
-        ...prev,
+      // New transcription segment started - clear previous and set new
+      setCurrentSegment({
         transcription: result.transcription
-      }));
+      });
     }
 
     if (result.gloss) {
@@ -52,10 +51,9 @@ export default function HomePage() {
         sigml: result.sigml
       };
 
+      // Add to sentences - don't clear current segment yet
+      // It will be cleared when the next transcription starts
       setSentences(prev => [...prev, completeSegment]);
-
-      // Clear current segment for next one
-      setCurrentSegment({});
 
       // Trigger animation for this new segment
       // The SiGML component will auto-play when it receives new content
@@ -103,14 +101,14 @@ export default function HomePage() {
               <div className="space-y-3">
                 {/* Transcription Display */}
                 <TranscriptionDisplay
-                  transcription={sentences.map(s => s.transcription).join(' ') + (currentSegment.transcription ? ` ${currentSegment.transcription}` : '')}
+                  transcription={sentences.map(s => s.transcription).join(' ') + (currentSegment.transcription && !sentences.find(s => s.transcription === currentSegment.transcription) ? ` ${currentSegment.transcription}` : '')}
                   isVisible={true}
                   language="English"
                 />
 
                 {/* Gloss Display */}
                 <GlossDisplay
-                  glossText={sentences.map(s => s.gloss).join(' ') + (currentSegment.gloss ? ` ${currentSegment.gloss}` : '')}
+                  glossText={sentences.map(s => s.gloss).join(' ') + (currentSegment.gloss && !sentences.find(s => s.gloss === currentSegment.gloss) ? ` ${currentSegment.gloss}` : '')}
                   isVisible={true}
                   originalText={sentences.map(s => s.transcription).join(' ')}
                 />
